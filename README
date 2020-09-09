@@ -201,7 +201,13 @@ Matternet Addendum
 ------------------
 We have now forked this open source software in our github.
 
-We have added the following features:
+Expected usage:
+
+./ntripclient -s <server> -m <mount point> -r <port> -u <Matternet username>
+  -p <Matternet password> -n <initial NMEA GGA sentence>
+
+
+We have added the following features/bugfixes:
 
   JIRA    Description
   ------  ------------
