@@ -736,7 +736,7 @@ int main(int argc, char **argv)
       //
       // Lines 748 - 1081 handle UDP mode
       // Lines 1083 - 1434 handle RTSP mode
-      // Lines 1436 - 1827 handle all the other modes
+      // Lines 1436 - 1824 handle all the other modes
       // 
       // In all cases, an http request for RTCM data is sent, an http response
       // is expected/processed.  In addition for the other modes, NMEA GGA 
@@ -1740,9 +1740,6 @@ int main(int argc, char **argv)
                     {
                       int j = 0;
                       if(i < 200) doloop = 0;
-
-                      // TODO: is this needed??? (write to IPC pipe back to MATE)
-                      fwrite(buf, i, 1, stdout);
 
                       // write NMEA GGA sentence to serial log file
                       if(ser)
