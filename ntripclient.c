@@ -600,9 +600,8 @@ int main(int argc, char **argv)
     return 20;
   }
 
-  int idx = 0;
   fprintf(flogfile, "args...\n");
-  for (idx = 0; idx < argc; idx++) {
+  for (int idx = 0; idx < argc; idx++) {
     fprintf(flogfile, "%s ", argv[idx]);
   }
   fprintf(flogfile, "\n");
@@ -734,9 +733,9 @@ int main(int argc, char **argv)
       // this block of code is very long and difficult to read.  I'll attempt
       // to summarize here.
       //
-      // Lines 748 - 1081 handle UDP mode
-      // Lines 1083 - 1434 handle RTSP mode
-      // Lines 1436 - 1824 handle all the other modes
+      // Lines 747 - 1080 handle UDP mode
+      // Lines 1082 - 1433 handle RTSP mode
+      // Lines 1435 - 1822 handle all the other modes
       // 
       // In all cases, an http request for RTCM data is sent, an http response
       // is expected/processed.  In addition for the other modes, NMEA GGA 
@@ -1719,8 +1718,7 @@ int main(int argc, char **argv)
 
 #ifdef NTRIPCLIENT_DEBUG_LOG
                       fprintf(flogfile, "IPC receive %d bytes\n", i);
-                      int k = 0;
-                      for (k = 0;  k < i; k++) {
+                      for (int k = 0;  k < i; k++) {
                         fprintf(flogfile, "%c", buf[k]);
                       }
                       fprintf(flogfile, "\n");
