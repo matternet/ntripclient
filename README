@@ -206,6 +206,11 @@ Expected usage:
 ./ntripclient -s <server> -m <mount point> -r <port> -u <Matternet username>
   -p <Matternet password> -n <initial NMEA GGA sentence>
 
+  Server (-s), mount point (-p), port (-r), username (-u), and password (-p)
+  are required.  NMEA parameter (-n) is optional.  Selecting NMEA without
+  providing an initial GGA sentence will be the same as not having the NMEA
+  option.
+
 
 We have added the following features/bugfixes:
 
