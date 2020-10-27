@@ -4,10 +4,10 @@
 
 ifdef windir
 CC   = gcc
-OPTS = -Wall -W -O3 -DWINDOWSVERSION 
+OPTS = -std=gnu99 -Wall -W -O3 -DWINDOWSVERSION 
 LIBS = -lwsock32
 else
-OPTS = -Wall -W -O3 
+OPTS = -std=gnu99 -Wall -W -O3 
 endif
 
 ntripclient: ntripclient.c serial.c
