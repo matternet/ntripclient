@@ -221,3 +221,6 @@ We have added the following features/bugfixes:
           to MATE. Send GGA sentence to NTRIP caster/server via socket
           connection.  Also removed compiler warnings (that occurred in some
           build environments) and added comments to explain functionality
+
+  AVX-61 modified make file to compile to gnu99 standard
+
