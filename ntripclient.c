@@ -29,10 +29,6 @@
 
 #include "serial.c"
 
-// uncomment this line to enable a logging to a log file to debug this client.
-// log file is hardcoded to "/home/debian/ntripclient/ntripclient.log"
-//#define NTRIPCLIENT_DEBUG_LOG
-
 #define STDIN_FD (0) // stdin file descriptor
 
 #ifdef WINDOWSVERSION
