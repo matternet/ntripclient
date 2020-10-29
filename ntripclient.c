@@ -605,6 +605,7 @@ int main(int argc, char **argv)
     fprintf(flogfile, "%s ", argv[idx]);
   }
   fprintf(flogfile, "\n");
+  fflush(flogfile);
   unsigned int count = 0;
 #endif // NTRIPCLIENT_DEBUG_LOG
 
@@ -1515,6 +1516,7 @@ int main(int argc, char **argv)
 #ifdef NTRIPCLIENT_DEBUG_LOG
             fprintf(flogfile, "sending http req\n");
             fprintf(flogfile, "%s\n", buf);
+            fflush(flogfile);
 #endif // NTRIPCLIENT_DEBUG_LOG
 
             if(send(sockfd, buf, (size_t)i, 0) != i)
@@ -1541,6 +1543,7 @@ int main(int argc, char **argv)
 #ifdef NTRIPCLIENT_DEBUG_LOG
                 fprintf(flogfile, "receiving http resp\n");
                 fprintf(flogfile, "%s\n", buf);
+                fflush(flogfile);
 #endif // NTRIPCLIENT_DEBUG_LOG
 
                 if(!k)
@@ -1712,6 +1715,7 @@ int main(int argc, char **argv)
 
 #ifdef NTRIPCLIENT_DEBUG_LOG
                       fprintf(flogfile, "requesting IPC receive\n");
+                      fflush(flogfile);
 #endif // NTRIPCLIENT_DEBUG_LOG
 
                       i = fread(buf, 1, 200, stdin);
@@ -1722,6 +1726,7 @@ int main(int argc, char **argv)
                         fprintf(flogfile, "%c", buf[k]);
                       }
                       fprintf(flogfile, "\n");
+                      fflush(flogfile);
 #endif // NTRIPCLIENT_DEBUG_LOG
 
                     }
@@ -1729,6 +1734,7 @@ int main(int argc, char **argv)
                     {
 #ifdef NTRIPCLIENT_DEBUG_LOG
                       fprintf(flogfile, "Could not get NMEA GGA data\n");
+                      fflush(flogfile);
 #endif // NTRIPCLIENT_DEBUG_LOG
 
                       fprintf(stderr, "Could not get NMEA GGA data\n");
@@ -1778,6 +1784,7 @@ int main(int argc, char **argv)
                             fprintf(flogfile, "SEND GGA to SOCKET, count = %d\n", count);
                             fprintf(flogfile, "nmeabufpos = %zu\n", nmeabufpos);
                             fprintf(flogfile, "%s\n", nmeabuffer);
+                            fflush(flogfile);
                             count++;
 #endif // NTRIPCLIENT_DEBUG_LOG
                           }
