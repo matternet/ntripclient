@@ -222,5 +222,7 @@ We have added the following features/bugfixes:
           connection.  Also removed compiler warnings (that occurred in some
           build environments) and added comments to explain functionality
 
-  AVX-61 modified make file to compile to gnu99 standard
+  AVX-61  modified make file to compile to gnu99 standard
+
+  AVX-67  added debug target and phony targets to makefile
 
