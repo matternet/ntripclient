@@ -201,6 +201,18 @@ Matternet Addendum
 ------------------
 We have now forked this open source software in our github.
 
+The standard production version is built with make:
+
+  make
+
+The build a debug version:
+
+  make debug
+
+The debug version creates a logfile with debug output in:
+  /home/debian/ntripclient/ntripclient.log 
+
+
 Expected usage:
 
 ./ntripclient -s <server> -m <mount point> -r <port> -u <Matternet username>
