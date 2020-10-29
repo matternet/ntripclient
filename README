@@ -201,6 +201,18 @@ Matternet Addendum
 ------------------
 We have now forked this open source software in our github.
 
+The standard production version is built with make:
+
+  make
+
+The build a debug version:
+
+  make debug
+
+The debug version creates a logfile with debug output in:
+  /home/debian/ntripclient/ntripclient.log 
+
+
 Expected usage:
 
 ./ntripclient -s <server> -m <mount point> -r <port> -u <Matternet username>
@@ -222,5 +234,7 @@ We have added the following features/bugfixes:
           connection.  Also removed compiler warnings (that occurred in some
           build environments) and added comments to explain functionality
 
-  AVX-61 modified make file to compile to gnu99 standard
+  AVX-61  modified make file to compile to gnu99 standard
 
+  AVX-67  added debug target and phony targets to makefile. Debug target
+          creates logfile, /home/debian/ntripclient/ntripclient.log

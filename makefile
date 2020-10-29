@@ -9,16 +9,28 @@ LIBS = -lwsock32
 else
 OPTS = -std=gnu99 -Wall -W -O3 
 endif
+DEBUG_OPTS = -DNTRIPCLIENT_DEBUG_LOG
+TARGET_NAME = ntripclient
 
 ntripclient: ntripclient.c serial.c
 	$(CC) $(OPTS) ntripclient.c -o $@ $(LIBS)
 
+debug: ntripclient.c serial.c
+	$(CC) $(OPTS) $(DEBUG_OPTS) ntripclient.c -o $(TARGET_NAME) $(LIBS)
+
+.PHONY : debug
+
 clean:
 	$(RM) ntripclient core*
 
+.PHONY : clean
 
 archive:
 	zip -9 ntripclient.zip ntripclient.c makefile README serial.c
 
+.PHONY : archive
+
 tgzarchive:
 	tar -czf ntripclient.tgz ntripclient.c makefile README serial.c
+
+.PHONY : tgzarchive
