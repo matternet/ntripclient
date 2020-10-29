@@ -238,3 +238,5 @@ We have added the following features/bugfixes:
 
   AVX-67  added debug target and phony targets to makefile. Debug target
           creates logfile, /home/debian/ntripclient/ntripclient.log
+
+  AVX-66  fixed bug preventing debug data from going to debug log file
