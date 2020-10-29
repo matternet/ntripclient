@@ -224,3 +224,4 @@ We have added the following features/bugfixes:
 
   AVX-61 modified make file to compile to gnu99 standard
 
+  AVX-66 fixed bug preventing debug data from going to debug log file
