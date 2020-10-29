@@ -224,5 +224,5 @@ We have added the following features/bugfixes:
 
   AVX-61  modified make file to compile to gnu99 standard
 
-  AVX-67  added debug target and phony targets to makefile
-
+  AVX-67  added debug target and phony targets to makefile. Debug target
+          creates logfile, /home/debian/ntripclient/ntripclient.log
