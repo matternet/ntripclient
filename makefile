@@ -5,9 +5,10 @@
 ifdef windir
 CC   = gcc
 OPTS = -std=gnu99 -Wall -W -O3 -DWINDOWSVERSION 
-LIBS = -lwsock32
+LIBS = -lwsock32 -lcurl
 else
 OPTS = -std=gnu99 -Wall -W -O3 
+LIBS = -lcurl
 endif
 DEBUG_OPTS = -DNTRIPCLIENT_DEBUG_LOG
 TARGET_NAME = ntripclient

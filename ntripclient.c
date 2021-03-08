@@ -26,10 +26,12 @@
 #include <errno.h>
 #include <string.h>
 #include <time.h>
-
+#include <curl/curl.h>
 #include "serial.c"
 
 #define STDIN_FD (0) // stdin file descriptor
+
+#define SLEEP_MS(ms)  usleep(ms * 1000)
 
 #ifdef WINDOWSVERSION
   #include <winsock.h>
@@ -69,7 +71,7 @@
 static char revisionstr[] = "$Revision: 1.51 $";
 static char datestr[]     = "$Date: 2009/09/11 09:49:19 $";
 
-enum MODE { HTTP = 1, RTSP = 2, NTRIP1 = 3, AUTO = 4, UDP = 5, END };
+enum MODE { HTTP = 1, RTSP = 2, NTRIP1 = 3, AUTO = 4, UDP = 5, HTTPS = 6, END };
 
 struct Args
 {
@@ -439,6 +441,8 @@ static int getargs(int argc, char **argv, struct Args *args)
         args->mode = NTRIP1;
       else if(!strcmp(optarg,"h") || !strcmp(optarg,"http"))
         args->mode = HTTP;
+      else if(!strcmp(optarg,"H") || !strcmp(optarg,"https"))
+        args->mode = HTTPS;
       else if(!strcmp(optarg,"r") || !strcmp(optarg,"rtsp"))
         args->mode = RTSP;
       else if(!strcmp(optarg,"u") || !strcmp(optarg,"udp"))
@@ -495,6 +499,7 @@ static int getargs(int argc, char **argv, struct Args *args)
     "     3, n, ntrip1   NTRIP Version 1.0 Caster\n"
     "     4, a, auto     automatic detection (default)\n"
     "     5, u, udp      NTRIP Version 2.0 Caster in UDP mode\n"
+    "     6, H, https    NTRIP Version 2.0 Caster in TCP/IP with TLS mode\n"
     "or using an URL:\n%s ntrip:mountpoint[/user[:password]][@[server][:port][@proxyhost[:proxyport]]][;nmea]\n"
     "\nExpert options:\n"
     " -n " LONG_OPT("--nmea       ") "NMEA string for sending to server\n"
@@ -564,6 +569,32 @@ static int encode(char *buf, int size, const char *user, const char *pwd)
   if(out-buf < size)
     *out = 0;
   return bytes;
+}
+
+static ssize_t curl_send_(CURL *curl, const void *buf, size_t len, int flags)
+{
+    (void)flags; // not used
+    size_t bytes_sent = 0;
+    CURLcode result = curl_easy_send(curl, buf, len, &bytes_sent);
+    return (result == CURLE_OK) ? bytes_sent : -1;
+}
+
+static ssize_t curl_recv_(CURL *curl, void *buf, size_t len, int flags)
+{
+    (void)flags; // not used
+    size_t bytes_recv = 0;
+    CURLcode result = CURLE_OK;
+
+    do
+    {
+        result = curl_easy_recv(curl, buf, len, &bytes_recv);
+
+        // Wait for 100ms before trying again.
+        if (result == CURLE_AGAIN)
+            SLEEP_MS(100);
+    } while (result == CURLE_AGAIN);
+
+    return (result == CURLE_OK) ? bytes_recv : -1;
 }
 
 int main(int argc, char **argv)
@@ -1432,8 +1463,29 @@ int main(int argc, char **argv)
         // handle all other modes
         else
         {
-          if(connect(sockfd, (struct sockaddr *)&their_addr,
-          sizeof(struct sockaddr)) == -1)
+          // Setup a Curl handle to wrap a normal socket to support TLS.
+          // Instead of using "recv/send", use "curl_recv_/curl_send_" instead.
+          curl_global_init(CURL_GLOBAL_DEFAULT);
+          CURL *curl = curl_easy_init();
+          if (curl == NULL)
+          {
+              error = 1;
+              break;
+          }
+
+          // create url string
+          char url[1024];
+          const char *proto = (args.mode == HTTPS) ? "https://" : "http://";
+          snprintf(url, sizeof(url), "%s%s", proto, server);
+          url[sizeof(url)-1] = 0;
+
+          // Set CURL options
+          curl_easy_setopt(curl, CURLOPT_URL, url);
+          curl_easy_setopt(curl, CURLOPT_PORT, atoi(port));
+          curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1L);
+          curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
+
+          if(curl_easy_perform(curl) != CURLE_OK)
           {
             myperror("connect");
             error = 1;
@@ -1446,7 +1498,6 @@ int main(int argc, char **argv)
               "GET %s%s%s%s/ HTTP/1.1\r\n"
               "Host: %s\r\n%s"
               "User-Agent: %s/%s\r\n"
-              "Connection: close\r\n"
               "\r\n"
               , proxyserver ? "http://" : "", proxyserver ? proxyserver : "",
               proxyserver ? ":" : "", proxyserver ? proxyport : "",
@@ -1455,14 +1506,14 @@ int main(int argc, char **argv)
             }
             else
             {
-              const char *nmeahead = (args.nmea && args.mode == HTTP) ? args.nmea : 0;
+              const char *nmeahead = (args.nmea && (args.mode == HTTP || args.mode == HTTPS)) ? args.nmea : 0;
 
               i=snprintf(buf, MAXDATASIZE-40, /* leave some space for login */
               "GET %s%s%s%s/%s HTTP/1.1\r\n"
               "Host: %s\r\n%s"
               "User-Agent: %s/%s\r\n"
               "%s%s%s"
-              "Connection: close%s"
+              "%s"
               , proxyserver ? "http://" : "", proxyserver ? proxyserver : "",
               proxyserver ? ":" : "", proxyserver ? proxyport : "",
               args.data, args.server,
@@ -1470,7 +1521,7 @@ int main(int argc, char **argv)
               AGENTSTRING, revisionstr,
               nmeahead ? "Ntrip-GGA: " : "", nmeahead ? nmeahead : "",
               nmeahead ? "\r\n" : "",
-              (*args.user || *args.password) ? "\r\nAuthorization: Basic " : "");
+              (*args.user || *args.password) ? "Authorization: Basic " : "");
               if(i > MAXDATASIZE-40 || i < 0) /* second check for old glibc */
               {
                 fprintf(stderr, "Requested data too long\n");
@@ -1515,7 +1566,7 @@ int main(int argc, char **argv)
             fflush(flogfile);
 #endif // NTRIPCLIENT_DEBUG_LOG
 
-            if(send(sockfd, buf, (size_t)i, 0) != i)
+            if(curl_send_(curl, buf, (size_t)i, 0) != i)
             {
               myperror("send");
               error = 1;
@@ -1530,7 +1581,7 @@ int main(int argc, char **argv)
               int chunksize = 0;
 
               while(!stop && !error &&
-              (numbytes=recv(sockfd, buf, MAXDATASIZE-1, 0)) > 0)
+              (numbytes=curl_recv_(curl, buf, MAXDATASIZE-1, 0)) > 0)
               {
 #ifndef WINDOWSVERSION
                 alarm(ALARMTIME);
@@ -1588,7 +1639,7 @@ int main(int argc, char **argv)
                   {
                     fprintf(stderr, "NTRIP version 2 HTTP connection failed%s.\n",
                     args.mode == AUTO ? ", falling back to NTRIP1" : "");
-                    if(args.mode == HTTP)
+                    if(args.mode == HTTP || args.mode == HTTPS)
                       stop = 1;
                   }
                   k = 1;
@@ -1770,7 +1821,7 @@ int main(int argc, char **argv)
                           nmeabuffer[nmeabufpos++] = '\n';
 
                           // send subsequent NMEA GGA sentence to NTRIP caster
-                          if(send(sockfd, nmeabuffer, nmeabufpos, 0)
+                          if(curl_send_(curl, nmeabuffer, nmeabufpos, 0)
                           != (int)nmeabufpos)
                           {
                             fprintf(stderr, "Could not send NMEA\n");
@@ -1813,7 +1864,7 @@ int main(int argc, char **argv)
             else
             {
               sleeptime = 0;
-              while(!stop && (numbytes=recv(sockfd, buf, MAXDATASIZE-1, 0)) > 0)
+              while(!stop && (numbytes=curl_recv_(curl, buf, MAXDATASIZE-1, 0)) > 0)
               {
   #ifndef WINDOWSVERSION
                 alarm(ALARMTIME);
@@ -1822,8 +1873,13 @@ int main(int argc, char **argv)
               }
             }
           }
+
+          if (curl)
+              curl_easy_cleanup(curl);
         }
       }
+
+      curl_global_cleanup();
 
       // close socket
       if(sockfd)
