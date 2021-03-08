@@ -1,36 +1,21 @@
-# $Id: makefile,v 1.8 2010/03/24 13:17:06 stoecker Exp $
-# probably works not with all compilers. Thought this should be easy
-# fixable. There is nothing special at this source.
-
-ifdef windir
-CC   = gcc
-OPTS = -std=gnu99 -Wall -W -O3 -DWINDOWSVERSION 
-LIBS = -lwsock32
-else
-OPTS = -std=gnu99 -Wall -W -O3 
-endif
-DEBUG_OPTS = -DNTRIPCLIENT_DEBUG_LOG
 TARGET_NAME = ntripclient
+CFLAGS = -std=gnu99 -Wall -W -O3
+LDFLAGS = -lcurl
+SOURCES := $(wildcard *.c)
+OBJS := $(patsubst %.c,%.o,$(SOURCES))
 
-ntripclient: ntripclient.c serial.c
-	$(CC) $(OPTS) ntripclient.c -o $@ $(LIBS)
+ifeq ($(DEBUG),1)
+  CFLAGS += -DDEBUG
+endif
 
-debug: ntripclient.c serial.c
-	$(CC) $(OPTS) $(DEBUG_OPTS) ntripclient.c -o $(TARGET_NAME) $(LIBS)
+all: $(TARGET_NAME)
 
-.PHONY : debug
+$(TARGET_NAME): $(OBJS)
+	$(CC) $(OBJS) -o $@ $(CFLAGS) $(LDFLAGS)
 
+%.o: %.c
+	@$(CC) $(CFLAGS) -c $<
+
+.PHONY: clean all
 clean:
-	$(RM) ntripclient core*
-
-.PHONY : clean
-
-archive:
-	zip -9 ntripclient.zip ntripclient.c makefile README serial.c
-
-.PHONY : archive
-
-tgzarchive:
-	tar -czf ntripclient.tgz ntripclient.c makefile README serial.c
-
-.PHONY : tgzarchive
+	rm *.o $(TARGET_NAME)
