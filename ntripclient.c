@@ -21,6 +21,7 @@
 
 #include <ctype.h>
 #include <getopt.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -32,6 +33,8 @@
 #define STDIN_FD (0) // stdin file descriptor
 
 #define SLEEP_MS(ms)  usleep(ms * 1000)
+#define HTTP_EOL_STR  "\r\n"
+#define HTTP_EOL_LEN  strlen(HTTP_EOL_STR)
 
 #ifdef WINDOWSVERSION
   #include <winsock.h>
@@ -72,6 +75,15 @@ static char revisionstr[] = "$Revision: 1.51 $";
 static char datestr[]     = "$Date: 2009/09/11 09:49:19 $";
 
 enum MODE { HTTP = 1, RTSP = 2, NTRIP1 = 3, AUTO = 4, UDP = 5, HTTPS = 6, END };
+
+typedef struct
+{
+    bool valid;
+    bool received_ok;
+    bool content_type_gnss_data;
+    bool ntrip_v2;
+    bool chunky_mode;
+} HttpHeader;
 
 struct Args
 {
@@ -576,7 +588,7 @@ static ssize_t curl_send_(CURL *curl, const void *buf, size_t len, int flags)
     (void)flags; // not used
     size_t bytes_sent = 0;
     CURLcode result = curl_easy_send(curl, buf, len, &bytes_sent);
-    return (result == CURLE_OK) ? bytes_sent : -1;
+    return (result == CURLE_OK) ? (ssize_t)bytes_sent : -1;
 }
 
 static ssize_t curl_recv_(CURL *curl, void *buf, size_t len, int flags)
@@ -594,7 +606,79 @@ static ssize_t curl_recv_(CURL *curl, void *buf, size_t len, int flags)
             SLEEP_MS(100);
     } while (result == CURLE_AGAIN);
 
-    return (result == CURLE_OK) ? bytes_recv : -1;
+    return (result == CURLE_OK) ? (ssize_t)bytes_recv : -1;
+}
+
+static int parse_http_header(CURL *curl, HttpHeader *hdr)
+{
+    char buf[MAXDATASIZE];
+    int total_bytes = 0;
+    bool hdr_done = false;
+
+    memset((void*)hdr, 0, sizeof(HttpHeader));
+
+    while (hdr_done == false)
+    {
+        // Read more data into the buffer; append to existing data if any.
+        ssize_t bytes_read = curl_recv_(curl, buf + total_bytes, MAXDATASIZE - total_bytes - 1, 0);
+        if (bytes_read <= 0)
+            return -1;
+
+        total_bytes += bytes_read;
+        buf[total_bytes] = 0;
+
+        // Extract each line
+        int bytes_consumed = 0;
+        while (total_bytes > 0)
+        {
+            int line_len = 0;
+            const char *line = buf + bytes_consumed;
+
+            // Get length of line
+            char *eol = strstr(line, HTTP_EOL_STR);
+            if (eol)
+            {
+                *eol = 0;  // Mark end of line
+                line_len = eol - line + HTTP_EOL_LEN;
+                bytes_consumed += line_len;
+            }
+            else
+            {
+                break;  // No more lines; go read more data from socket.
+            }
+
+            // Set flags based on the line string.
+            if (strncmp(line, "", line_len) == 0)
+            {
+                // End of header; exit function
+                hdr_done = true;
+                break;
+            }
+            else if (strncmp(line, "HTTP/1.1 200 OK", line_len) == 0 ||
+                     strncmp(line, "HTTP/1.0 200 OK", line_len) == 0)
+            {
+                hdr->received_ok = true;
+            }
+            else if (strncmp(line, "Ntrip-Version: Ntrip/2.0", line_len) == 0)
+            {
+                hdr->ntrip_v2 = true;
+            }
+            else if (strncmp(line, "Content-Type: gnss/data", line_len) == 0)
+            {
+                hdr->content_type_gnss_data = true;
+            }
+            else if (strncmp(line, "Transfer-Encoding: chunked", line_len) == 0)
+            {
+                hdr->chunky_mode = true;
+            }
+        }
+
+        // shift unused bytes to the beginning of the array.
+        total_bytes -= bytes_consumed;
+        memmove(buf, buf + bytes_consumed, total_bytes);
+    }
+
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -1573,12 +1657,22 @@ int main(int argc, char **argv)
             }
             else if(args.data && *args.data != '%')
             {
-              int k = 0;
-              int chunkymode = 0;
               int starttime = time(0);
               int lastout = starttime;
-              int totalbytes = 0;
+
+              HttpHeader http_hdr;
+              int retcode = parse_http_header(curl, &http_hdr);
+
+              // Make sure header is correct
+              if (retcode != 0 || http_hdr.received_ok == false || http_hdr.content_type_gnss_data == false)
+              {
+                error = 1;
+              }
+
+              // Parse HTTP body
               int chunksize = 0;
+              int chunkystate = 1;
+              int totalbytes = 0;
 
               while(!stop && !error &&
               (numbytes=curl_recv_(curl, buf, MAXDATASIZE-1, 0)) > 0)
@@ -1592,92 +1686,29 @@ int main(int argc, char **argv)
                 fprintf(flogfile, "%s\n", buf);
                 fflush(flogfile);
 #endif // NTRIPCLIENT_DEBUG_LOG
-
-                if(!k)
-                {
-                  buf[numbytes] = 0; /* latest end mark for strstr */
-                  if( numbytes > 17 &&
-                    !strstr(buf, "ICY 200 OK")  &&  /* case 'proxy & ntrip 1.0 caster' */
-                    (!strncmp(buf, "HTTP/1.1 200 OK\r\n", 17) ||
-                    !strncmp(buf, "HTTP/1.0 200 OK\r\n", 17)) )
-                  {
-                    const char *datacheck = "Content-Type: gnss/data\r\n";
-                    const char *chunkycheck = "Transfer-Encoding: chunked\r\n";
-                    int l = strlen(datacheck)-1;
-                    int j=0;
-                    for(i = 0; j != l && i < numbytes-l; ++i)
-                    {
-                      for(j = 0; j < l && buf[i+j] == datacheck[j]; ++j)
-                        ;
-                    }
-                    if(i == numbytes-l)
-                    {
-                      fprintf(stderr, "No 'Content-Type: gnss/data' found\n");
-                      error = 1;
-                    }
-                    l = strlen(chunkycheck)-1;
-                    j=0;
-                    for(i = 0; j != l && i < numbytes-l; ++i)
-                    {
-                      for(j = 0; j < l && buf[i+j] == chunkycheck[j]; ++j)
-                        ;
-                    }
-                    if(i < numbytes-l)
-                      chunkymode = 1;
-                  }
-                  else if(!strstr(buf, "ICY 200 OK"))
-                  {
-                    fprintf(stderr, "Could not get the requested data: ");
-                    for(k = 0; k < numbytes && buf[k] != '\n' && buf[k] != '\r'; ++k)
-                    {
-                      fprintf(stderr, "%c", isprint(buf[k]) ? buf[k] : '.');
-                    }
-                    fprintf(stderr, "\n");
-                    error = 1;
-                  }
-                  else if(args.mode != NTRIP1)
-                  {
-                    fprintf(stderr, "NTRIP version 2 HTTP connection failed%s.\n",
-                    args.mode == AUTO ? ", falling back to NTRIP1" : "");
-                    if(args.mode == HTTP || args.mode == HTTPS)
-                      stop = 1;
-                  }
-                  k = 1;
-                  if(args.mode == NTRIP1)
-                    continue; /* skip old headers for NTRIP1 */
-                  else
-                  {
-                    char *ep = strstr(buf, "\r\n\r\n");
-                    if(!ep || ep+4 == buf+numbytes)
-                      continue;
-                    ep += 4;
-                    memmove(buf, ep, numbytes-(ep-buf));
-                    numbytes -= (ep-buf);
-                  }
-                }
                 sleeptime = 0;
-                if(chunkymode)
+                if(http_hdr.chunky_mode)
                 {
                   int cstop = 0;
                   int pos = 0;
                   while(!stop && !cstop && !error && pos < numbytes)
                   {
-                    switch(chunkymode)
+                    switch(chunkystate)
                     {
                     case 1: /* reading number starts */
                       chunksize = 0;
-                      ++chunkymode; /* no break */
+                      ++chunkystate; /* no break */
                     case 2: /* during reading number */
                       i = buf[pos++];
                       if(i >= '0' && i <= '9') chunksize = chunksize*16+i-'0';
                       else if(i >= 'a' && i <= 'f') chunksize = chunksize*16+i-'a'+10;
                       else if(i >= 'A' && i <= 'F') chunksize = chunksize*16+i-'A'+10;
-                      else if(i == '\r') ++chunkymode;
-                      else if(i == ';') chunkymode = 5;
+                      else if(i == '\r') ++chunkystate;
+                      else if(i == ';') chunkystate = 5;
                       else cstop = 1;
                       break;
                     case 3: /* scanning for return */
-                      if(buf[pos++] == '\n') chunkymode = chunksize ? 4 : 1;
+                      if(buf[pos++] == '\n') chunkystate = chunksize ? 4 : 1;
                       else cstop = 1;
                       break;
                     case 4: /* output data */
@@ -1704,10 +1735,10 @@ int main(int argc, char **argv)
                       chunksize -= i;
                       pos += i;
                       if(!chunksize)
-                        chunkymode = 1;
+                        chunkystate = 1;
                       break;
                     case 5:
-                      if(i == '\r') chunkymode = 3;
+                      if(i == '\r') chunkystate = 3;
                       break;
                     }
                   }
