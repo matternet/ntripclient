@@ -1,0 +1,3 @@
+*.o
+*.a
+rtcm_parser/rtcm_parser
