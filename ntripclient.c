@@ -1590,21 +1590,16 @@ int main(int argc, char **argv)
             }
             else
             {
-              const char *nmeahead = (args.nmea && (args.mode == HTTP || args.mode == HTTPS)) ? args.nmea : 0;
-
               i=snprintf(buf, MAXDATASIZE-40, /* leave some space for login */
               "GET %s%s%s%s/%s HTTP/1.1\r\n"
               "Host: %s\r\n%s"
               "User-Agent: %s/%s\r\n"
-              "%s%s%s"
               "%s"
               , proxyserver ? "http://" : "", proxyserver ? proxyserver : "",
               proxyserver ? ":" : "", proxyserver ? proxyport : "",
               args.data, args.server,
               args.mode == NTRIP1 ? "" : "Ntrip-Version: Ntrip/2.0\r\n",
               AGENTSTRING, revisionstr,
-              nmeahead ? "Ntrip-GGA: " : "", nmeahead ? nmeahead : "",
-              nmeahead ? "\r\n" : "",
               (*args.user || *args.password) ? "Authorization: Basic " : "");
               if(i > MAXDATASIZE-40 || i < 0) /* second check for old glibc */
               {
@@ -1626,18 +1621,10 @@ int main(int argc, char **argv)
                   buf[i++] = '\r';
                   buf[i++] = '\n';
 
-                  // send initial NMEA GGA sentence
-                  if(args.nmea && !nmeahead)
-                  {
-                    int j = snprintf(buf+i, MAXDATASIZE-i, "%s\r\n", args.nmea);
-                    if(j >= 0 && j < MAXDATASIZE-i)
-                      i += j;
-                    else
-                    {
-                      fprintf(stderr, "NMEA string too long\n");
-                      stop = 1;
-                    }
-                  }
+                  // Note: Don't add NMEA string to the body of the HTTP GET message.
+                  // The server ignores the body of the GET message. The message
+                  // will be sent after the handshake. See below where the NMEA
+                  // string is sent after parsing the HTTP response message.
                 }
               }
             }
@@ -1667,6 +1654,29 @@ int main(int argc, char **argv)
               if (retcode != 0 || http_hdr.received_ok == false || http_hdr.content_type_gnss_data == false)
               {
                 error = 1;
+              }
+
+              // If an NMEA string is passed in the command line send it after
+              // sending the HTTP header. If the NMEA string is sent in the HTTP
+              // header as "Ntrip-GGA:" then the server will start sending RTCM
+              // data immediately. This will cause the header parsing above to
+              // contain header response message and some RTCM data causing us to
+              // have partial messages.
+              if (args.nmea)
+              {
+                  char nmea_str[1000];
+                  int len = snprintf(nmea_str, sizeof(nmea_str), "%s\r\n", args.nmea);
+
+                  if (len >= sizeof(nmea_str))
+                  {
+                      fprintf(stderr, "Buffer not big enough for NMEA string\n");
+                      error = 1;
+                  }
+                  else if (curl_send_(curl, nmea_str, len, 0) != len)
+                  {
+                      myperror("send nmea failed");
+                      error = 1;
+                  }
               }
 
               // Parse HTTP body
