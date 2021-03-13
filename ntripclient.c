@@ -845,18 +845,20 @@ int main(int argc, char **argv)
       // this block of code is very long and difficult to read.  I'll attempt
       // to summarize here.
       //
-      // Lines 747 - 1080 handle UDP mode
-      // Lines 1082 - 1433 handle RTSP mode
-      // Lines 1435 - 1822 handle all the other modes
-      // 
+      // There are three major sections below. Use the text below as search
+      // strings to jump to the specific section:
+      //   Handle UDP mode
+      //   Handle RTSP mode
+      //   Handle all other modes
+      //
       // In all cases, an http request for RTCM data is sent, an http response
-      // is expected/processed.  In addition for the other modes, NMEA GGA 
-      // sentences are received from a GGA source and sent to the NTRIP 
-      // caster/server.  The GGA source can be either a serial device (e.g. 
+      // is expected/processed.  In addition for the other modes, NMEA GGA
+      // sentences are received from a GGA source and sent to the NTRIP
+      // caster/server.  The GGA source can be either a serial device (e.g.
       // GPS receiver) or an IPC pipe (e.g MATE).
       if(!stop && !error)
       {
-        // Handle UPD mode
+        // Handle UDP mode
         if(args.mode == UDP)
         {
           unsigned int session;
@@ -1544,7 +1546,7 @@ int main(int argc, char **argv)
           }
         }
 
-        // handle all other modes
+        // Handle all other modes
         else
         {
           // Setup a Curl handle to wrap a normal socket to support TLS.
@@ -1667,7 +1669,12 @@ int main(int argc, char **argv)
                   char nmea_str[1000];
                   int len = snprintf(nmea_str, sizeof(nmea_str), "%s\r\n", args.nmea);
 
-                  if (len >= sizeof(nmea_str))
+                  if (len < 0)
+                  {
+                      fprintf(stderr, "Error creating NMEA string\n");
+                      error = 1;
+                  }
+                  else if (len >= (int)sizeof(nmea_str))
                   {
                       fprintf(stderr, "Buffer not big enough for NMEA string\n");
                       error = 1;
