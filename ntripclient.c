@@ -66,8 +66,8 @@
 #define MAXDATASIZE 1000 /* max number of bytes we can get at once */
 
 /* CVS revision and version */
-static char revisionstr[] = "$Revision: 1.51 $";
-static char datestr[]     = "$Date: 2009/09/11 09:49:19 $";
+static char revisionstr[] = "$Revision: 1.60 $";
+static char datestr[]     = "$Date: 2021/03/18 09:49:19 $";
 
 enum MODE { HTTP = 1, RTSP = 2, NTRIP1 = 3, AUTO = 4, UDP = 5, END };
 
