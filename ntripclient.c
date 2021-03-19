@@ -609,7 +609,7 @@ static ssize_t curl_recv_(CURL *curl, void *buf, size_t len, int flags)
     return (result == CURLE_OK) ? (ssize_t)bytes_recv : -1;
 }
 
-static int parse_http_header(CURL *curl, HttpHeader *hdr)
+static bool parse_http_header(CURL *curl, HttpHeader *hdr)
 {
     char buf[MAXDATASIZE];
     int total_bytes = 0;
@@ -622,7 +622,7 @@ static int parse_http_header(CURL *curl, HttpHeader *hdr)
         // Read more data into the buffer; append to existing data if any.
         ssize_t bytes_read = curl_recv_(curl, buf + total_bytes, MAXDATASIZE - total_bytes - 1, 0);
         if (bytes_read <= 0)
-            return -1;
+            return false;
 
         total_bytes += bytes_read;
         buf[total_bytes] = 0;
@@ -678,7 +678,7 @@ static int parse_http_header(CURL *curl, HttpHeader *hdr)
         memmove(buf, buf + bytes_consumed, total_bytes);
     }
 
-    return 0;
+    return true;
 }
 
 int main(int argc, char **argv)
@@ -1650,10 +1650,10 @@ int main(int argc, char **argv)
               int lastout = starttime;
 
               HttpHeader http_hdr;
-              int retcode = parse_http_header(curl, &http_hdr);
+              bool header_parsed = parse_http_header(curl, &http_hdr);
 
               // Make sure header is correct
-              if (retcode != 0 || http_hdr.received_ok == false || http_hdr.content_type_gnss_data == false)
+              if (header_parsed == false || http_hdr.received_ok == false || http_hdr.content_type_gnss_data == false)
               {
                 error = 1;
               }
