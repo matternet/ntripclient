@@ -482,6 +482,12 @@ static int getargs(int argc, char **argv, struct Args *args)
     }
   } while(getoptr != -1 && res);
 
+  // Use HTTPS/TLS if mode is auto and port is 2102
+  if ((args->mode == AUTO) && (strcmp(args->port, "2102") == 0))
+  {
+    args->mode = HTTPS;
+  }
+
   for(a = revisionstr+11; *a && *a != ' '; ++a)
     revisionstr[i++] = *a;
   revisionstr[i] = 0;
