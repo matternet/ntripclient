@@ -21,15 +21,20 @@
 
 #include <ctype.h>
 #include <getopt.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
 #include <time.h>
-
+#include <curl/curl.h>
 #include "serial.c"
 
 #define STDIN_FD (0) // stdin file descriptor
+
+#define SLEEP_MS(ms)  usleep(ms * 1000)
+#define HTTP_EOL_STR  "\r\n"
+#define HTTP_EOL_LEN  strlen(HTTP_EOL_STR)
 
 #ifdef WINDOWSVERSION
   #include <winsock.h>
@@ -66,10 +71,19 @@
 #define MAXDATASIZE 1000 /* max number of bytes we can get at once */
 
 /* CVS revision and version */
-static char revisionstr[] = "$Revision: 1.60 $";
+static char revisionstr[] = "$Revision: 1.6.1 $";
 static char datestr[]     = "$Date: 2021/03/18 09:49:19 $";
 
-enum MODE { HTTP = 1, RTSP = 2, NTRIP1 = 3, AUTO = 4, UDP = 5, END };
+enum MODE { HTTP = 1, RTSP = 2, NTRIP1 = 3, AUTO = 4, UDP = 5, HTTPS = 6, END };
+
+typedef struct
+{
+    bool valid;
+    bool received_ok;
+    bool content_type_gnss_data;
+    bool ntrip_v2;
+    bool chunky_mode;
+} HttpHeader;
 
 struct Args
 {
@@ -439,6 +453,8 @@ static int getargs(int argc, char **argv, struct Args *args)
         args->mode = NTRIP1;
       else if(!strcmp(optarg,"h") || !strcmp(optarg,"http"))
         args->mode = HTTP;
+      else if(!strcmp(optarg,"H") || !strcmp(optarg,"https"))
+        args->mode = HTTPS;
       else if(!strcmp(optarg,"r") || !strcmp(optarg,"rtsp"))
         args->mode = RTSP;
       else if(!strcmp(optarg,"u") || !strcmp(optarg,"udp"))
@@ -465,6 +481,12 @@ static int getargs(int argc, char **argv, struct Args *args)
     case -1: break;
     }
   } while(getoptr != -1 && res);
+
+  // Use HTTPS/TLS if mode is auto and port is 2102
+  if ((args->mode == AUTO) && (strcmp(args->port, "2102") == 0))
+  {
+    args->mode = HTTPS;
+  }
 
   for(a = revisionstr+11; *a && *a != ' '; ++a)
     revisionstr[i++] = *a;
@@ -495,6 +517,7 @@ static int getargs(int argc, char **argv, struct Args *args)
     "     3, n, ntrip1   NTRIP Version 1.0 Caster\n"
     "     4, a, auto     automatic detection (default)\n"
     "     5, u, udp      NTRIP Version 2.0 Caster in UDP mode\n"
+    "     6, H, https    NTRIP Version 2.0 Caster in TCP/IP with TLS mode\n"
     "or using an URL:\n%s ntrip:mountpoint[/user[:password]][@[server][:port][@proxyhost[:proxyport]]][;nmea]\n"
     "\nExpert options:\n"
     " -n " LONG_OPT("--nmea       ") "NMEA string for sending to server\n"
@@ -564,6 +587,104 @@ static int encode(char *buf, int size, const char *user, const char *pwd)
   if(out-buf < size)
     *out = 0;
   return bytes;
+}
+
+static ssize_t curl_send_(CURL *curl, const void *buf, size_t len, int flags)
+{
+    (void)flags; // not used
+    size_t bytes_sent = 0;
+    CURLcode result = curl_easy_send(curl, buf, len, &bytes_sent);
+    return (result == CURLE_OK) ? (ssize_t)bytes_sent : -1;
+}
+
+static ssize_t curl_recv_(CURL *curl, void *buf, size_t len, int flags)
+{
+    (void)flags; // not used
+    size_t bytes_recv = 0;
+    CURLcode result = CURLE_OK;
+
+    do
+    {
+        result = curl_easy_recv(curl, buf, len, &bytes_recv);
+
+        // Wait for 100ms before trying again.
+        if (result == CURLE_AGAIN)
+            SLEEP_MS(100);
+    } while (result == CURLE_AGAIN);
+
+    return (result == CURLE_OK) ? (ssize_t)bytes_recv : -1;
+}
+
+static bool parse_http_header(CURL *curl, HttpHeader *hdr)
+{
+    char buf[MAXDATASIZE];
+    int total_bytes = 0;
+    bool hdr_done = false;
+
+    memset((void*)hdr, 0, sizeof(HttpHeader));
+
+    while (hdr_done == false)
+    {
+        // Read more data into the buffer; append to existing data if any.
+        ssize_t bytes_read = curl_recv_(curl, buf + total_bytes, MAXDATASIZE - total_bytes - 1, 0);
+        if (bytes_read <= 0)
+            return false;
+
+        total_bytes += bytes_read;
+        buf[total_bytes] = 0;
+
+        // Extract each line
+        int bytes_consumed = 0;
+        while (total_bytes > 0)
+        {
+            int line_len = 0;
+            const char *line = buf + bytes_consumed;
+
+            // Get length of line
+            char *eol = strstr(line, HTTP_EOL_STR);
+            if (eol)
+            {
+                *eol = 0;  // Mark end of line
+                line_len = eol - line + HTTP_EOL_LEN;
+                bytes_consumed += line_len;
+            }
+            else
+            {
+                break;  // No more lines; go read more data from socket.
+            }
+
+            // Set flags based on the line string.
+            if (strncmp(line, "", line_len) == 0)
+            {
+                // End of header; exit function
+                hdr_done = true;
+                break;
+            }
+            else if (strncmp(line, "HTTP/1.1 200 OK", line_len) == 0 ||
+                     strncmp(line, "HTTP/1.0 200 OK", line_len) == 0)
+            {
+                hdr->received_ok = true;
+            }
+            else if (strncmp(line, "Ntrip-Version: Ntrip/2.0", line_len) == 0)
+            {
+                hdr->ntrip_v2 = true;
+            }
+            else if (strncmp(line, "Content-Type: gnss/data", line_len) == 0)
+            {
+                hdr->content_type_gnss_data = true;
+            }
+            else if (strncmp(line, "Transfer-Encoding: chunked", line_len) == 0)
+            {
+                hdr->chunky_mode = true;
+            }
+        }
+
+        // shift unused bytes to the beginning of the array.
+        total_bytes -= bytes_consumed;
+        memmove(buf, buf + bytes_consumed, total_bytes);
+    }
+
+    return true;
 }
 
 int main(int argc, char **argv)
@@ -730,18 +851,20 @@ int main(int argc, char **argv)
       // this block of code is very long and difficult to read.  I'll attempt
       // to summarize here.
       //
-      // Lines 747 - 1080 handle UDP mode
-      // Lines 1082 - 1433 handle RTSP mode
-      // Lines 1435 - 1822 handle all the other modes
-      // 
+      // There are three major sections below. Use the text below as search
+      // strings to jump to the specific section:
+      //   Handle UDP mode
+      //   Handle RTSP mode
+      //   Handle all other modes
+      //
       // In all cases, an http request for RTCM data is sent, an http response
-      // is expected/processed.  In addition for the other modes, NMEA GGA 
-      // sentences are received from a GGA source and sent to the NTRIP 
-      // caster/server.  The GGA source can be either a serial device (e.g. 
+      // is expected/processed.  In addition for the other modes, NMEA GGA
+      // sentences are received from a GGA source and sent to the NTRIP
+      // caster/server.  The GGA source can be either a serial device (e.g.
       // GPS receiver) or an IPC pipe (e.g MATE).
       if(!stop && !error)
       {
-        // Handle UPD mode
+        // Handle UDP mode
         if(args.mode == UDP)
         {
           unsigned int session;
@@ -1429,11 +1552,32 @@ int main(int argc, char **argv)
           }
         }
 
-        // handle all other modes
+        // Handle all other modes
         else
         {
-          if(connect(sockfd, (struct sockaddr *)&their_addr,
-          sizeof(struct sockaddr)) == -1)
+          // Setup a Curl handle to wrap a normal socket to support TLS.
+          // Instead of using "recv/send", use "curl_recv_/curl_send_" instead.
+          curl_global_init(CURL_GLOBAL_DEFAULT);
+          CURL *curl = curl_easy_init();
+          if (curl == NULL)
+          {
+              error = 1;
+              break;
+          }
+
+          // create url string
+          char url[1024];
+          const char *proto = (args.mode == HTTPS) ? "https://" : "http://";
+          snprintf(url, sizeof(url), "%s%s", proto, server);
+          url[sizeof(url)-1] = 0;
+
+          // Set CURL options
+          curl_easy_setopt(curl, CURLOPT_URL, url);
+          curl_easy_setopt(curl, CURLOPT_PORT, atoi(port));
+          curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1L);
+          curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
+
+          if(curl_easy_perform(curl) != CURLE_OK)
           {
             myperror("connect");
             error = 1;
@@ -1446,7 +1590,6 @@ int main(int argc, char **argv)
               "GET %s%s%s%s/ HTTP/1.1\r\n"
               "Host: %s\r\n%s"
               "User-Agent: %s/%s\r\n"
-              "Connection: close\r\n"
               "\r\n"
               , proxyserver ? "http://" : "", proxyserver ? proxyserver : "",
               proxyserver ? ":" : "", proxyserver ? proxyport : "",
@@ -1455,22 +1598,17 @@ int main(int argc, char **argv)
             }
             else
             {
-              const char *nmeahead = (args.nmea && args.mode == HTTP) ? args.nmea : 0;
-
               i=snprintf(buf, MAXDATASIZE-40, /* leave some space for login */
               "GET %s%s%s%s/%s HTTP/1.1\r\n"
               "Host: %s\r\n%s"
               "User-Agent: %s/%s\r\n"
-              "%s%s%s"
-              "Connection: close%s"
+              "%s"
               , proxyserver ? "http://" : "", proxyserver ? proxyserver : "",
               proxyserver ? ":" : "", proxyserver ? proxyport : "",
               args.data, args.server,
               args.mode == NTRIP1 ? "" : "Ntrip-Version: Ntrip/2.0\r\n",
               AGENTSTRING, revisionstr,
-              nmeahead ? "Ntrip-GGA: " : "", nmeahead ? nmeahead : "",
-              nmeahead ? "\r\n" : "",
-              (*args.user || *args.password) ? "\r\nAuthorization: Basic " : "");
+              (*args.user || *args.password) ? "Authorization: Basic " : "");
               if(i > MAXDATASIZE-40 || i < 0) /* second check for old glibc */
               {
                 fprintf(stderr, "Requested data too long\n");
@@ -1491,18 +1629,10 @@ int main(int argc, char **argv)
                   buf[i++] = '\r';
                   buf[i++] = '\n';
 
-                  // send initial NMEA GGA sentence
-                  if(args.nmea && !nmeahead)
-                  {
-                    int j = snprintf(buf+i, MAXDATASIZE-i, "%s\r\n", args.nmea);
-                    if(j >= 0 && j < MAXDATASIZE-i)
-                      i += j;
-                    else
-                    {
-                      fprintf(stderr, "NMEA string too long\n");
-                      stop = 1;
-                    }
-                  }
+                  // Note: Don't add NMEA string to the body of the HTTP GET message.
+                  // The server ignores the body of the GET message. The message
+                  // will be sent after the handshake. See below where the NMEA
+                  // string is sent after parsing the HTTP response message.
                 }
               }
             }
@@ -1515,22 +1645,60 @@ int main(int argc, char **argv)
             fflush(flogfile);
 #endif // NTRIPCLIENT_DEBUG_LOG
 
-            if(send(sockfd, buf, (size_t)i, 0) != i)
+            if(curl_send_(curl, buf, (size_t)i, 0) != i)
             {
               myperror("send");
               error = 1;
             }
             else if(args.data && *args.data != '%')
             {
-              int k = 0;
-              int chunkymode = 0;
               int starttime = time(0);
               int lastout = starttime;
-              int totalbytes = 0;
+
+              HttpHeader http_hdr;
+              bool header_parsed = parse_http_header(curl, &http_hdr);
+
+              // Make sure header is correct
+              if (header_parsed == false || http_hdr.received_ok == false || http_hdr.content_type_gnss_data == false)
+              {
+                error = 1;
+              }
+
+              // If an NMEA string is passed in the command line send it after
+              // sending the HTTP header. If the NMEA string is sent in the HTTP
+              // header as "Ntrip-GGA:" then the server will start sending RTCM
+              // data immediately. This will cause the header parsing above to
+              // contain header response message and some RTCM data causing us to
+              // have partial messages.
+              if (args.nmea)
+              {
+                  char nmea_str[1000];
+                  int len = snprintf(nmea_str, sizeof(nmea_str), "%s\r\n", args.nmea);
+
+                  if (len < 0)
+                  {
+                      fprintf(stderr, "Error creating NMEA string\n");
+                      error = 1;
+                  }
+                  else if (len >= (int)sizeof(nmea_str))
+                  {
+                      fprintf(stderr, "Buffer not big enough for NMEA string\n");
+                      error = 1;
+                  }
+                  else if (curl_send_(curl, nmea_str, len, 0) != len)
+                  {
+                      myperror("send nmea failed");
+                      error = 1;
+                  }
+              }
+
+              // Parse HTTP body
               int chunksize = 0;
+              int chunkystate = 1;
+              int totalbytes = 0;
 
               while(!stop && !error &&
-              (numbytes=recv(sockfd, buf, MAXDATASIZE-1, 0)) > 0)
+              (numbytes=curl_recv_(curl, buf, MAXDATASIZE-1, 0)) > 0)
               {
 #ifndef WINDOWSVERSION
                 alarm(ALARMTIME);
@@ -1541,92 +1709,29 @@ int main(int argc, char **argv)
                 fprintf(flogfile, "%s\n", buf);
                 fflush(flogfile);
 #endif // NTRIPCLIENT_DEBUG_LOG
-
-                if(!k)
-                {
-                  buf[numbytes] = 0; /* latest end mark for strstr */
-                  if( numbytes > 17 &&
-                    !strstr(buf, "ICY 200 OK")  &&  /* case 'proxy & ntrip 1.0 caster' */
-                    (!strncmp(buf, "HTTP/1.1 200 OK\r\n", 17) ||
-                    !strncmp(buf, "HTTP/1.0 200 OK\r\n", 17)) )
-                  {
-                    const char *datacheck = "Content-Type: gnss/data\r\n";
-                    const char *chunkycheck = "Transfer-Encoding: chunked\r\n";
-                    int l = strlen(datacheck)-1;
-                    int j=0;
-                    for(i = 0; j != l && i < numbytes-l; ++i)
-                    {
-                      for(j = 0; j < l && buf[i+j] == datacheck[j]; ++j)
-                        ;
-                    }
-                    if(i == numbytes-l)
-                    {
-                      fprintf(stderr, "No 'Content-Type: gnss/data' found\n");
-                      error = 1;
-                    }
-                    l = strlen(chunkycheck)-1;
-                    j=0;
-                    for(i = 0; j != l && i < numbytes-l; ++i)
-                    {
-                      for(j = 0; j < l && buf[i+j] == chunkycheck[j]; ++j)
-                        ;
-                    }
-                    if(i < numbytes-l)
-                      chunkymode = 1;
-                  }
-                  else if(!strstr(buf, "ICY 200 OK"))
-                  {
-                    fprintf(stderr, "Could not get the requested data: ");
-                    for(k = 0; k < numbytes && buf[k] != '\n' && buf[k] != '\r'; ++k)
-                    {
-                      fprintf(stderr, "%c", isprint(buf[k]) ? buf[k] : '.');
-                    }
-                    fprintf(stderr, "\n");
-                    error = 1;
-                  }
-                  else if(args.mode != NTRIP1)
-                  {
-                    fprintf(stderr, "NTRIP version 2 HTTP connection failed%s.\n",
-                    args.mode == AUTO ? ", falling back to NTRIP1" : "");
-                    if(args.mode == HTTP)
-                      stop = 1;
-                  }
-                  k = 1;
-                  if(args.mode == NTRIP1)
-                    continue; /* skip old headers for NTRIP1 */
-                  else
-                  {
-                    char *ep = strstr(buf, "\r\n\r\n");
-                    if(!ep || ep+4 == buf+numbytes)
-                      continue;
-                    ep += 4;
-                    memmove(buf, ep, numbytes-(ep-buf));
-                    numbytes -= (ep-buf);
-                  }
-                }
                 sleeptime = 0;
-                if(chunkymode)
+                if(http_hdr.chunky_mode)
                 {
                   int cstop = 0;
                   int pos = 0;
                   while(!stop && !cstop && !error && pos < numbytes)
                   {
-                    switch(chunkymode)
+                    switch(chunkystate)
                     {
                     case 1: /* reading number starts */
                       chunksize = 0;
-                      ++chunkymode; /* no break */
+                      ++chunkystate; /* no break */
                     case 2: /* during reading number */
                       i = buf[pos++];
                       if(i >= '0' && i <= '9') chunksize = chunksize*16+i-'0';
                       else if(i >= 'a' && i <= 'f') chunksize = chunksize*16+i-'a'+10;
                       else if(i >= 'A' && i <= 'F') chunksize = chunksize*16+i-'A'+10;
-                      else if(i == '\r') ++chunkymode;
-                      else if(i == ';') chunkymode = 5;
+                      else if(i == '\r') ++chunkystate;
+                      else if(i == ';') chunkystate = 5;
                       else cstop = 1;
                       break;
                     case 3: /* scanning for return */
-                      if(buf[pos++] == '\n') chunkymode = chunksize ? 4 : 1;
+                      if(buf[pos++] == '\n') chunkystate = chunksize ? 4 : 1;
                       else cstop = 1;
                       break;
                     case 4: /* output data */
@@ -1653,10 +1758,10 @@ int main(int argc, char **argv)
                       chunksize -= i;
                       pos += i;
                       if(!chunksize)
-                        chunkymode = 1;
+                        chunkystate = 1;
                       break;
                     case 5:
-                      if(i == '\r') chunkymode = 3;
+                      if(i == '\r') chunkystate = 3;
                       break;
                     }
                   }
@@ -1770,7 +1875,7 @@ int main(int argc, char **argv)
                           nmeabuffer[nmeabufpos++] = '\n';
 
                           // send subsequent NMEA GGA sentence to NTRIP caster
-                          if(send(sockfd, nmeabuffer, nmeabufpos, 0)
+                          if(curl_send_(curl, nmeabuffer, nmeabufpos, 0)
                           != (int)nmeabufpos)
                           {
                             fprintf(stderr, "Could not send NMEA\n");
@@ -1813,7 +1918,7 @@ int main(int argc, char **argv)
             else
             {
               sleeptime = 0;
-              while(!stop && (numbytes=recv(sockfd, buf, MAXDATASIZE-1, 0)) > 0)
+              while(!stop && (numbytes=curl_recv_(curl, buf, MAXDATASIZE-1, 0)) > 0)
               {
   #ifndef WINDOWSVERSION
                 alarm(ALARMTIME);
@@ -1822,8 +1927,13 @@ int main(int argc, char **argv)
               }
             }
           }
+
+          if (curl)
+              curl_easy_cleanup(curl);
         }
       }
+
+      curl_global_cleanup();
 
       // close socket
       if(sockfd)
