@@ -2,14 +2,8 @@
 # probably works not with all compilers. Thought this should be easy
 # fixable. There is nothing special at this source.
 
-ifdef windir
-CC   = gcc
-OPTS = -std=gnu99 -Wall -W -O3 -DWINDOWSVERSION 
-LIBS = -lwsock32 -lcurl
-else
-OPTS = -std=gnu99 -Wall -W -O3 
-LIBS = -lcurl
-endif
+OPTS = -std=gnu99 -Wall -W -O3
+LIBS = -l:libcurl.a -l:libssl.a -l:libcrypto.a -lpthread -ldl
 DEBUG_OPTS = -DNTRIPCLIENT_DEBUG_LOG
 TARGET_NAME = ntripclient
 
