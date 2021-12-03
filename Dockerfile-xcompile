@@ -1,0 +1,65 @@
+# Dockerfile to cross compile for Debian BeagleBoneBlack
+FROM 011301565624.dkr.ecr.us-west-2.amazonaws.com/matternet/ubuntu:18.04
+
+WORKDIR /home/matternet/
+
+# Install tools required to build
+RUN apt-get update && apt-get install -y make perl wget xz-utils
+
+# Setup environment for cross compile
+ENV TARGETSDK="/opt/targetsdk"
+ENV SYSROOT="/opt/targetsdk/arm-linux-gnueabihf"
+ENV BUILDFLAGS="-mfpu=neon -mfloat-abi=hard -mcpu=cortex-a8"
+ENV CC="arm-linux-gnueabihf-gcc $BUILDFLAGS"
+ENV CXX="arm-linux-gnueabihf-g++ $BUILDFLAGS"
+ENV LD="arm-poky-linux-gnueabi-ld --sysroot=$SYSROOT"
+ENV AR="arm-linux-gnueabihf-ar"
+ENV AS="arm-poky-linux-gnueabi-as"
+ENV RANLIB="arm-linux-gnueabihf-ranlib"
+ENV PATH=$TARGETSDK/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Download cross compile toolchain used in Debian BeagleBoneBlack
+RUN wget https://releases.linaro.org/components/toolchain/binaries/4.9-2016.02/arm-linux-gnueabihf/gcc-linaro-4.9-2016.02-x86_64_arm-linux-gnueabihf.tar.xz && \
+    tar -xf gcc-linaro-4.9-2016.02-x86_64_arm-linux-gnueabihf.tar.xz && \
+    mv gcc-linaro-4.9-2016.02-x86_64_arm-linux-gnueabihf /opt/targetsdk && \
+    rm gcc-linaro-4.9-2016.02-x86_64_arm-linux-gnueabihf.tar.xz
+
+# Download openssl and curl source code
+RUN wget https://www.openssl.org/source/openssl-1.1.0l.tar.gz && \
+    wget https://curl.se/download/curl-7.54.1.tar.gz && \
+    tar -xf openssl-1.1.0l.tar.gz && \
+    tar -xf curl-7.54.1.tar.gz && \
+    rm *.tar.gz
+
+# Build openssl
+RUN cd openssl-1.1.0l && \
+    ./Configure linux-armv4 \
+                no-ssl2 no-ssl3 no-comp no-idea no-dtls no-err no-nextprotoneg no-srp no-weak-ssl-ciphers no-psk no-dtls \
+                -DOPENSSL_USE_IPV6=0 \
+                --prefix=/opt/targetsdk/arm-linux-gnueabihf \
+                --openssldir=/opt/targetsdk/arm-linux-gnueabihf && \
+    make -j && \
+    make install_sw && \
+    cd .. && \
+    rm -rf openssl-1.1.0l
+
+# Build curl
+RUN cd curl-7.54.1 && \
+    ./configure --with-ssl=/opt/targetsdk/arm-linux-gnueabihf \
+                --with-random=/dev/urandom \
+                --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt \
+                --disable-ipv6 --disable-shared --without-zlib \
+                --build=x86_64-linux \
+                --host=arm-linux-gnueabihf \
+                --prefix=/opt/targetsdk/arm-linux-gnueabihf && \
+    make -j && \
+    make install && \
+    cd .. && \
+    rm -rf curl-7.54.1
+
+# Create a matternet user so compiled binary aren't restricted to root
+RUN useradd -s /bin/bash -U -m matternet
+USER matternet
+
+# Build application when user runs this docker
+CMD make clean && make

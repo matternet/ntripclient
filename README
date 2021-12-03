@@ -1,4 +1,30 @@
 ----------------------------------------------------------------------
+                       MATTERNET NOTES
+----------------------------------------------------------------------
+This branch is only intended for cross-compilation for Debian BBB.
+This build links openssl and curl statically instead of dynamically.
+A new openssl version is required to fix a bug related to expired
+certificates. Curl must also be updated to be compatible with the
+newer openssl. More information can be found here:
+https://letsencrypt.org/docs/dst-root-ca-x3-expiration-september-2021/
+
+A docker image is created to cross compile the newer openssl and curl.
+We don't want to install multiple versions of openssl and curl on the
+BBB. The workaround is to statically link these libraries to
+ntripclient. This also reduces the changes needed on the Debian OS for
+regulatory reasons.
+
+Note that this branch will be obsolete when we migrate to the Yocto
+image for BBB. Yocto uses a more recent version of openssl and curl.
+When this happens, we can once again use dynamic linkage to save space,
+reduce maintenance and provide consistency.
+
+To cross compile for Debian BBB run "build-xcompile.sh".
+The initial build takes 5 minutes to build the docker image.
+Subsequent builds will be much faster. The output executable
+is "ntripclient".
+
+----------------------------------------------------------------------
                 NTRIP Client for POSIX systems
 ----------------------------------------------------------------------
 
