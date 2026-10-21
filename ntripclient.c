@@ -116,8 +116,8 @@ static void log_msg(const char *fmt, ...)
 #define MAXDATASIZE 1000 /* max number of bytes we can get at once */
 
 /* CVS revision and version */
-static char revisionstr[] = "$Revision: 1.6.1 $";
-static char datestr[]     = "$Date: 2021/03/18 09:49:19 $";
+static char revisionstr[] = "$Revision: 1.7.0 $";
+static char datestr[]     = "$Date: 2026/10/21 00:00:00 $";
 
 enum MODE { HTTP = 1, RTSP = 2, NTRIP1 = 3, AUTO = 4, UDP = 5, HTTPS = 6, END };
 
