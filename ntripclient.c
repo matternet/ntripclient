@@ -70,9 +70,15 @@
 #define CONNECT_TIMEOUT_SEC     10
 #define RECONNECT_BACKOFF_MIN   1     /* seconds, doubles per failed session, capped */
 #define RECONNECT_BACKOFF_MAX   8
-#define MAX_FAILED_RECONNECTS   3     /* consecutive sessions with no RTCM -> exit */
-#define EXIT_RECONNECT_FAILED   3     /* non-zero so MATE restarts us */
 #define RECV_NO_DATA  (-2)            /* curl_recv_(): nothing within RECV_POLL_TIMEOUT_MS */
+
+/* Monotonic seconds for timeouts: immune to wall-clock steps when NTP/GPS sets the time after boot. */
+static time_t mono_sec(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec;
+}
 
 #ifdef NTRIPCLIENT_DEBUG_LOG
 static FILE *flogfile = NULL;
@@ -195,11 +201,12 @@ int sig __attribute__((__unused__)))
 static void sighandler_alarm(int sig)
 #endif /* __GNUC__ */
 {
-  if(!sigstop)
-    log_msg("ERROR: backstop alarm, more than %d seconds no activity, exiting", ALARMTIME);
-  else
-    log_msg("ERROR: user break, exiting");
-  exit(1);
+  /* Only async-signal-safe calls here: fixed message via write(2), then _exit(). */
+  static const char msg_alarm[] = "ntripclient: ERROR: backstop alarm, no activity, exiting\n";
+  static const char msg_break[] = "ntripclient: ERROR: user break, exiting\n";
+  ssize_t r = sigstop ? write(2, msg_break, sizeof(msg_break) - 1) : write(2, msg_alarm, sizeof(msg_alarm) - 1);
+  (void)r;
+  _exit(1);
 }
 
 #ifdef __GNUC__
@@ -680,14 +687,14 @@ static bool parse_http_header(CURL *curl, HttpHeader *hdr)
 
     memset((void*)hdr, 0, sizeof(HttpHeader));
 
-    time_t deadline = time(0) + HEADER_TIMEOUT_SEC;
+    time_t deadline = mono_sec() + HEADER_TIMEOUT_SEC;
     while (hdr_done == false)
     {
         // Read more data into the buffer; append to existing data if any.
         ssize_t bytes_read = curl_recv_(curl, buf + total_bytes, MAXDATASIZE - total_bytes - 1, 0);
         if (bytes_read == RECV_NO_DATA)
         {
-            if (time(0) >= deadline)
+            if (mono_sec() >= deadline)
             {
                 log_msg("no HTTP response header within %d s", HEADER_TIMEOUT_SEC);
                 return false;
@@ -757,7 +764,6 @@ static bool parse_http_header(CURL *curl, HttpHeader *hdr)
 int main(int argc, char **argv)
 {
   struct Args args;
-  int exit_code = 0;
 
   setbuf(stdout, 0);
   setbuf(stdin, 0);
@@ -805,7 +811,6 @@ int main(int argc, char **argv)
     char last_gga[sizeof(nmeabuffer)];  /* newest GGA sent, re-sent on (re)connect */
     size_t last_gga_len = 0;
     int reconnect_backoff = 0;          /* seconds before the next session attempt */
-    int failed_reconnects = 0;          /* consecutive sessions that delivered no RTCM */
     if(args.serdevice)
     {
       const char *e = SerialInit(&sx, args.serdevice, args.baud,
@@ -841,8 +846,7 @@ int main(int argc, char **argv)
       long session_rtcm_bytes = 0;
       if(reconnect_backoff)
       {
-        log_msg("reconnecting in %d s (consecutive sessions without RTCM: %d of %d)",
-                reconnect_backoff, failed_reconnects, MAX_FAILED_RECONNECTS);
+        log_msg("reconnecting in %d s", reconnect_backoff);
 #ifdef WINDOWSVERSION
         Sleep(reconnect_backoff*1000);
 #else
@@ -1784,7 +1788,7 @@ int main(int argc, char **argv)
               int chunksize = 0;
               int chunkystate = 1;
               int totalbytes = 0;
-              time_t last_rtcm = time(0);  /* data watchdog: session start counts as activity */
+              time_t last_rtcm = mono_sec();  /* data watchdog: session start counts as activity */
 
               while(!stop && !error)
               {
@@ -1795,13 +1799,13 @@ int main(int argc, char **argv)
                 if(numbytes == 0 || (numbytes < 0 && numbytes != RECV_NO_DATA))
                 {
                   log_msg("%s (%ld s since last RTCM)", numbytes == 0 ? "connection closed by caster" : "receive error",
-                          (long)(time(0) - last_rtcm));
+                          (long)(mono_sec() - last_rtcm));
                   error = 1;
                   break;
                 }
                 if(numbytes > 0)
                 { /* ---- data received: original processing, unchanged ---- */
-                last_rtcm = time(0);
+                last_rtcm = mono_sec();
                 session_rtcm_bytes += numbytes;
 #ifdef NTRIPCLIENT_DEBUG_LOG
                 fprintf(flogfile, "receiving http resp (%d bytes)\n", numbytes);
@@ -1900,9 +1904,9 @@ int main(int argc, char **argv)
                 } /* ---- end data received ---- */
 
                 // Data watchdog (OS-556): session open but silent -> close and reconnect.
-                if(!stop && !error && time(0) - last_rtcm >= DATA_WATCHDOG_SEC)
+                if(!stop && !error && mono_sec() - last_rtcm >= DATA_WATCHDOG_SEC)
                 {
-                  log_msg("data watchdog tripped, no RTCM for %ld s, reconnecting", (long)(time(0) - last_rtcm));
+                  log_msg("data watchdog tripped, no RTCM for %ld s, reconnecting", (long)(mono_sec() - last_rtcm));
                   error = 1;
                   break;
                 }
@@ -1910,7 +1914,7 @@ int main(int argc, char **argv)
                 // get subsequent NMEA GGA sentence from GGA source and
                 // send it to NTRIP caster.  Source can be either serial device
                 // or IPC pipe
-                if(args.nmea && !stop)
+                if(args.nmea && !stop && !error)
                 {
                   int doloop = 1;
                   while(doloop && !stop)
@@ -2026,7 +2030,7 @@ int main(int argc, char **argv)
             }
             else
             {
-              time_t last_data = time(0);
+              time_t last_data = mono_sec();
               while(!stop)
               {
                 numbytes = curl_recv_(curl, buf, MAXDATASIZE-1, 0);
@@ -2035,11 +2039,11 @@ int main(int argc, char **argv)
   #endif
                 if(numbytes == RECV_NO_DATA)
                 {
-                  if(time(0) - last_data > HEADER_TIMEOUT_SEC) break;
+                  if(mono_sec() - last_data > HEADER_TIMEOUT_SEC) break;
                   continue;
                 }
                 if(numbytes <= 0) break;
-                last_data = time(0);
+                last_data = mono_sec();
                 fwrite(buf, (size_t)numbytes, 1, stdout);
               }
             }
@@ -2056,27 +2060,21 @@ int main(int argc, char **argv)
       if(sockfd)
         closesocket(sockfd);
 
-      // Reconnect bookkeeping (OS-556): backoff 1/2/4/8 s instead of sleep(10); a session
-      // that delivered RTCM resets the failure count, three empty sessions in a row -> exit.
+      // Reconnect bookkeeping (OS-556): backoff 1/2/4/8 s instead of sleep(10). We stay in-process
+      // and keep retrying; a session that delivered RTCM resets the backoff. (No deliberate exit:
+      // every restart costs MATE a pipe pair and truncates /tmp/ntriperror on current releases.)
       if(!stop)
       {
         if(session_rtcm_bytes > 0)
         {
-          failed_reconnects = 0;
           reconnect_backoff = RECONNECT_BACKOFF_MIN;
           log_msg("session ended after %ld RTCM bytes, reconnecting", session_rtcm_bytes);
-        }
-        else if(++failed_reconnects >= MAX_FAILED_RECONNECTS)
-        {
-          log_msg("%d consecutive sessions without RTCM, exiting with code %d so MATE restarts us",
-                  failed_reconnects, EXIT_RECONNECT_FAILED);
-          exit_code = EXIT_RECONNECT_FAILED;
-          stop = 1;
         }
         else
         {
           reconnect_backoff = reconnect_backoff ? reconnect_backoff * 2 : RECONNECT_BACKOFF_MIN;
           if(reconnect_backoff > RECONNECT_BACKOFF_MAX) reconnect_backoff = RECONNECT_BACKOFF_MAX;
+          log_msg("session ended with no RTCM");
         }
       }
     } while(args.data && *args.data != '%' && !stop);
@@ -2090,10 +2088,10 @@ int main(int argc, char **argv)
     if(ser)
       fclose(ser);
   }
-  log_msg("exiting with code %d", exit_code);
+  log_msg("exiting");
 #ifdef NTRIPCLIENT_DEBUG_LOG
   if (flogfile)
     fclose(flogfile);
 #endif // NTRIPCLIENT_DEBUG_LOG
-  return exit_code;
+  return 0;
 }
