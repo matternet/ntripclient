@@ -240,3 +240,13 @@ We have added the following features/bugfixes:
           creates logfile, /home/debian/ntripclient/ntripclient.log
 
   AVX-66  fixed bug preventing debug data from going to debug log file
+
+  OS-556  Detect silent stalls and reconnect in seconds (v1.7.0). Bounded
+          receive (1 s poll instead of spinning on CURLE_AGAIN), GGA sent on
+          a 1 s timer regardless of inbound data and newest GGA sent on
+          (re)connect, 10 s data watchdog with 1/2/4/8 s reconnect backoff
+          (stays in-process and keeps retrying; MATE's own RTCM watchdog
+          is the backstop), ALARMTIME lowered 120 s -> 30 s, chunked-
+          encoding chunk-extension hang fixed, TCP
+          keepalive + connect/header timeouts, UTC-timestamped logging, and
+          debug log opened in append mode.

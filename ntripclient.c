@@ -27,6 +27,8 @@
 #include <errno.h>
 #include <string.h>
 #include <time.h>
+#include <stdarg.h>
+#include <poll.h>
 #include <curl/curl.h>
 #include "serial.c"
 
@@ -56,9 +58,58 @@
   #include <netdb.h>
 
   #define closesocket(sock)       close(sock)
-  #define ALARMTIME   (2*60)
+  /* Backstop only (OS-556): the data watchdog below is the primary stall detector. */
+  #define ALARMTIME   (30)
   #define myperror perror
 #endif
+
+/* Stall detection / reconnect tuning (OS-556) */
+#define RECV_POLL_TIMEOUT_MS    1000  /* max time a single recv waits for data */
+#define DATA_WATCHDOG_SEC       10    /* no RTCM for this long -> reconnect */
+#define HEADER_TIMEOUT_SEC      10    /* max wait for the HTTP response header */
+#define CONNECT_TIMEOUT_SEC     10
+#define RECONNECT_BACKOFF_MIN   1     /* seconds, doubles per failed session, capped */
+#define RECONNECT_BACKOFF_MAX   8
+#define RECV_NO_DATA  (-2)            /* curl_recv_(): nothing within RECV_POLL_TIMEOUT_MS */
+
+/* Monotonic seconds for timeouts: immune to wall-clock steps when NTP/GPS sets the time after boot. */
+static time_t mono_sec(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec;
+}
+
+#ifdef NTRIPCLIENT_DEBUG_LOG
+static FILE *flogfile = NULL;
+#endif
+
+/* UTC-timestamped line to stderr (and the debug log in the debug build). */
+static void log_msg(const char *fmt, ...)
+{
+  char ts[32];
+  time_t now = time(0);
+  struct tm tmv;
+  gmtime_r(&now, &tmv);
+  strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+  va_list ap;
+  va_start(ap, fmt);
+  fprintf(stderr, "%s ntripclient: ", ts);
+  vfprintf(stderr, fmt, ap);
+  fprintf(stderr, "\n");
+  va_end(ap);
+#ifdef NTRIPCLIENT_DEBUG_LOG
+  if(flogfile)
+  {
+    va_start(ap, fmt);
+    fprintf(flogfile, "%s ", ts);
+    vfprintf(flogfile, fmt, ap);
+    fprintf(flogfile, "\n");
+    fflush(flogfile);
+    va_end(ap);
+  }
+#endif
+}
 
 #ifndef COMPILEDATE
 #define COMPILEDATE " built " __DATE__
@@ -71,8 +122,8 @@
 #define MAXDATASIZE 1000 /* max number of bytes we can get at once */
 
 /* CVS revision and version */
-static char revisionstr[] = "$Revision: 1.6.1 $";
-static char datestr[]     = "$Date: 2021/03/18 09:49:19 $";
+static char revisionstr[] = "$Revision: 1.7.0 $";
+static char datestr[]     = "$Date: 2026/10/21 00:00:00 $";
 
 enum MODE { HTTP = 1, RTSP = 2, NTRIP1 = 3, AUTO = 4, UDP = 5, HTTPS = 6, END };
 
@@ -150,11 +201,12 @@ int sig __attribute__((__unused__)))
 static void sighandler_alarm(int sig)
 #endif /* __GNUC__ */
 {
-  if(!sigstop)
-    fprintf(stderr, "ERROR: more than %d seconds no activity\n", ALARMTIME);
-  else
-    fprintf(stderr, "ERROR: user break\n");
-  exit(1);
+  /* Only async-signal-safe calls here: fixed message via write(2), then _exit(). */
+  static const char msg_alarm[] = "ntripclient: ERROR: backstop alarm, no activity, exiting\n";
+  static const char msg_break[] = "ntripclient: ERROR: user break, exiting\n";
+  ssize_t r = sigstop ? write(2, msg_break, sizeof(msg_break) - 1) : write(2, msg_alarm, sizeof(msg_alarm) - 1);
+  (void)r;
+  _exit(1);
 }
 
 #ifdef __GNUC__
@@ -597,22 +649,34 @@ static ssize_t curl_send_(CURL *curl, const void *buf, size_t len, int flags)
     return (result == CURLE_OK) ? (ssize_t)bytes_sent : -1;
 }
 
+// Bounded receive (OS-556). Returns bytes received, 0 on close, -1 on error, or
+// RECV_NO_DATA if nothing arrived within RECV_POLL_TIMEOUT_MS so the caller keeps
+// control. Previously this spun on CURLE_AGAIN forever.
 static ssize_t curl_recv_(CURL *curl, void *buf, size_t len, int flags)
 {
     (void)flags; // not used
     size_t bytes_recv = 0;
-    CURLcode result = CURLE_OK;
+    CURLcode result = curl_easy_recv(curl, buf, len, &bytes_recv);
+    if (result == CURLE_OK)
+        return (ssize_t)bytes_recv;
+    if (result != CURLE_AGAIN)
+        return -1;
 
-    do
-    {
-        result = curl_easy_recv(curl, buf, len, &bytes_recv);
+    curl_socket_t sockfd = CURL_SOCKET_BAD;
+    if (curl_easy_getinfo(curl, CURLINFO_ACTIVESOCKET, &sockfd) != CURLE_OK || sockfd == CURL_SOCKET_BAD)
+        return -1;
+    struct pollfd pfd = { sockfd, POLLIN, 0 };
+    int rc = poll(&pfd, 1, RECV_POLL_TIMEOUT_MS);
+    if (rc < 0)
+        return (errno == EINTR) ? RECV_NO_DATA : -1;
+    if (rc == 0)
+        return RECV_NO_DATA;
 
-        // Wait for 100ms before trying again.
-        if (result == CURLE_AGAIN)
-            SLEEP_MS(100);
-    } while (result == CURLE_AGAIN);
-
-    return (result == CURLE_OK) ? (ssize_t)bytes_recv : -1;
+    // Readable (or error/hangup): let curl report the actual condition.
+    result = curl_easy_recv(curl, buf, len, &bytes_recv);
+    if (result == CURLE_OK)
+        return (ssize_t)bytes_recv;
+    return (result == CURLE_AGAIN) ? RECV_NO_DATA : -1;
 }
 
 static bool parse_http_header(CURL *curl, HttpHeader *hdr)
@@ -623,10 +687,20 @@ static bool parse_http_header(CURL *curl, HttpHeader *hdr)
 
     memset((void*)hdr, 0, sizeof(HttpHeader));
 
+    time_t deadline = mono_sec() + HEADER_TIMEOUT_SEC;
     while (hdr_done == false)
     {
         // Read more data into the buffer; append to existing data if any.
         ssize_t bytes_read = curl_recv_(curl, buf + total_bytes, MAXDATASIZE - total_bytes - 1, 0);
+        if (bytes_read == RECV_NO_DATA)
+        {
+            if (mono_sec() >= deadline)
+            {
+                log_msg("no HTTP response header within %d s", HEADER_TIMEOUT_SEC);
+                return false;
+            }
+            continue;
+        }
         if (bytes_read <= 0)
             return false;
 
@@ -712,7 +786,8 @@ int main(int argc, char **argv)
   fcntl(STDIN_FD, F_SETFL, flags | O_NONBLOCK);
 
 #ifdef NTRIPCLIENT_DEBUG_LOG
-  FILE *flogfile = fopen("/home/debian/ntripclient/ntripclient.log", "w+");
+  // Append so a restart does not wipe the evidence of why the previous instance died.
+  flogfile = fopen("/home/debian/ntripclient/ntripclient.log", "a");
   if (!flogfile) {
     return 20;
   }
@@ -733,7 +808,9 @@ int main(int argc, char **argv)
     char nmeabuffer[200] = "$GPGGA,"; /* our start string */
     size_t nmeabufpos = 0;
     size_t nmeastarpos = 0;
-    int sleeptime = 0;
+    char last_gga[sizeof(nmeabuffer)];  /* newest GGA sent, re-sent on (re)connect */
+    size_t last_gga_len = 0;
+    int reconnect_backoff = 0;          /* seconds before the next session attempt */
     if(args.serdevice)
     {
       const char *e = SerialInit(&sx, args.serdevice, args.baud,
@@ -766,18 +843,15 @@ int main(int argc, char **argv)
       char proxyport[6];
       char *b;
       long i;
-      if(sleeptime)
+      long session_rtcm_bytes = 0;
+      if(reconnect_backoff)
       {
+        log_msg("reconnecting in %d s", reconnect_backoff);
 #ifdef WINDOWSVERSION
-        Sleep(sleeptime*1000);
+        Sleep(reconnect_backoff*1000);
 #else
-        sleep(sleeptime);
+        sleep(reconnect_backoff);
 #endif
-        sleeptime += 2;
-      }
-      else
-      {
-        sleeptime = 1;
       }
 #ifndef WINDOWSVERSION
       alarm(ALARMTIME);
@@ -1576,12 +1650,19 @@ int main(int argc, char **argv)
           curl_easy_setopt(curl, CURLOPT_PORT, atoi(port));
           curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1L);
           curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
+          curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (long)CONNECT_TIMEOUT_SEC);
+          curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+          curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 5L);
+          curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 5L);
 
-          if(curl_easy_perform(curl) != CURLE_OK)
+          CURLcode cres = curl_easy_perform(curl);
+          if(cres != CURLE_OK)
           {
-            myperror("connect");
+            log_msg("connect to %s:%s failed: %s", server, port, curl_easy_strerror(cres));
             error = 1;
           }
+          else
+            log_msg("connected to %s:%s", server, port);
           if(!stop && !error)
           {
             if(!args.data)
@@ -1661,6 +1742,8 @@ int main(int argc, char **argv)
               // Make sure header is correct
               if (header_parsed == false || http_hdr.received_ok == false || http_hdr.content_type_gnss_data == false)
               {
+                log_msg("bad or missing HTTP response header (parsed=%d ok=%d gnss=%d)",
+                        header_parsed, http_hdr.received_ok, http_hdr.content_type_gnss_data);
                 error = 1;
               }
 
@@ -1670,7 +1753,16 @@ int main(int argc, char **argv)
               // data immediately. This will cause the header parsing above to
               // contain header response message and some RTCM data causing us to
               // have partial messages.
-              if (args.nmea)
+              if (args.nmea && last_gga_len > 0)
+              {
+                  // Reconnect: send the newest GGA we have, not the launch-time -n value.
+                  if (!error && curl_send_(curl, last_gga, last_gga_len, 0) != (int)last_gga_len)
+                  {
+                      log_msg("could not send GGA on reconnect");
+                      error = 1;
+                  }
+              }
+              else if (args.nmea)
               {
                   char nmea_str[1000];
                   int len = snprintf(nmea_str, sizeof(nmea_str), "%s\r\n", args.nmea);
@@ -1696,20 +1788,29 @@ int main(int argc, char **argv)
               int chunksize = 0;
               int chunkystate = 1;
               int totalbytes = 0;
+              time_t last_rtcm = mono_sec();  /* data watchdog: session start counts as activity */
 
-              while(!stop && !error &&
-              (numbytes=curl_recv_(curl, buf, MAXDATASIZE-1, 0)) > 0)
+              while(!stop && !error)
               {
+                numbytes = curl_recv_(curl, buf, MAXDATASIZE-1, 0);
 #ifndef WINDOWSVERSION
-                alarm(ALARMTIME);
+                alarm(ALARMTIME);  /* recv is bounded, so this is only a busy-loop backstop now */
 #endif
-
+                if(numbytes == 0 || (numbytes < 0 && numbytes != RECV_NO_DATA))
+                {
+                  log_msg("%s (%ld s since last RTCM)", numbytes == 0 ? "connection closed by caster" : "receive error",
+                          (long)(mono_sec() - last_rtcm));
+                  error = 1;
+                  break;
+                }
+                if(numbytes > 0)
+                { /* ---- data received: original processing, unchanged ---- */
+                last_rtcm = mono_sec();
+                session_rtcm_bytes += numbytes;
 #ifdef NTRIPCLIENT_DEBUG_LOG
-                fprintf(flogfile, "receiving http resp\n");
-                fprintf(flogfile, "%s\n", buf);
+                fprintf(flogfile, "receiving http resp (%d bytes)\n", numbytes);
                 fflush(flogfile);
 #endif // NTRIPCLIENT_DEBUG_LOG
-                sleeptime = 0;
                 if(http_hdr.chunky_mode)
                 {
                   int cstop = 0;
@@ -1760,14 +1861,15 @@ int main(int argc, char **argv)
                       if(!chunksize)
                         chunkystate = 1;
                       break;
-                    case 5:
+                    case 5: /* skip chunk extension up to CR; previously never consumed a byte (hang) */
+                      i = buf[pos++];
                       if(i == '\r') chunkystate = 3;
                       break;
                     }
                   }
                   if(cstop)
                   {
-                    fprintf(stderr, "Error in chunky transfer encoding\n");
+                    log_msg("error in chunked transfer encoding, reconnecting");
                     error = 1;
                   }
                 }
@@ -1799,11 +1901,20 @@ int main(int argc, char **argv)
                   starttime = time(0);
                   lastout = starttime;
                 }
+                } /* ---- end data received ---- */
+
+                // Data watchdog (OS-556): session open but silent -> close and reconnect.
+                if(!stop && !error && mono_sec() - last_rtcm >= DATA_WATCHDOG_SEC)
+                {
+                  log_msg("data watchdog tripped, no RTCM for %ld s, reconnecting", (long)(mono_sec() - last_rtcm));
+                  error = 1;
+                  break;
+                }
 
                 // get subsequent NMEA GGA sentence from GGA source and
                 // send it to NTRIP caster.  Source can be either serial device
                 // or IPC pipe
-                if(args.nmea && !stop)
+                if(args.nmea && !stop && !error)
                 {
                   int doloop = 1;
                   while(doloop && !stop)
@@ -1875,10 +1986,12 @@ int main(int argc, char **argv)
                           nmeabuffer[nmeabufpos++] = '\n';
 
                           // send subsequent NMEA GGA sentence to NTRIP caster
+                          memcpy(last_gga, nmeabuffer, nmeabufpos);
+                          last_gga_len = nmeabufpos;
                           if(curl_send_(curl, nmeabuffer, nmeabufpos, 0)
                           != (int)nmeabufpos)
                           {
-                            fprintf(stderr, "Could not send NMEA\n");
+                            log_msg("could not send GGA");
                             error = 1;
                           } else {
 #ifdef NTRIPCLIENT_DEBUG_LOG
@@ -1917,12 +2030,20 @@ int main(int argc, char **argv)
             }
             else
             {
-              sleeptime = 0;
-              while(!stop && (numbytes=curl_recv_(curl, buf, MAXDATASIZE-1, 0)) > 0)
+              time_t last_data = mono_sec();
+              while(!stop)
               {
+                numbytes = curl_recv_(curl, buf, MAXDATASIZE-1, 0);
   #ifndef WINDOWSVERSION
                 alarm(ALARMTIME);
   #endif
+                if(numbytes == RECV_NO_DATA)
+                {
+                  if(mono_sec() - last_data > HEADER_TIMEOUT_SEC) break;
+                  continue;
+                }
+                if(numbytes <= 0) break;
+                last_data = mono_sec();
                 fwrite(buf, (size_t)numbytes, 1, stdout);
               }
             }
@@ -1938,7 +2059,24 @@ int main(int argc, char **argv)
       // close socket
       if(sockfd)
         closesocket(sockfd);
-      sleep(10);
+
+      // Reconnect bookkeeping (OS-556): backoff 1/2/4/8 s instead of sleep(10). We stay in-process
+      // and keep retrying; a session that delivered RTCM resets the backoff. (No deliberate exit:
+      // every restart costs MATE a pipe pair and truncates /tmp/ntriperror on current releases.)
+      if(!stop)
+      {
+        if(session_rtcm_bytes > 0)
+        {
+          reconnect_backoff = RECONNECT_BACKOFF_MIN;
+          log_msg("session ended after %ld RTCM bytes, reconnecting", session_rtcm_bytes);
+        }
+        else
+        {
+          reconnect_backoff = reconnect_backoff ? reconnect_backoff * 2 : RECONNECT_BACKOFF_MIN;
+          if(reconnect_backoff > RECONNECT_BACKOFF_MAX) reconnect_backoff = RECONNECT_BACKOFF_MAX;
+          log_msg("session ended with no RTCM");
+        }
+      }
     } while(args.data && *args.data != '%' && !stop);
 
     // close serial device
@@ -1949,10 +2087,11 @@ int main(int argc, char **argv)
     // close serial log file
     if(ser)
       fclose(ser);
-#ifdef NTRIPCLIENT_DEBUG_LOG
-    if (flogfile)
-      fclose(flogfile);
-#endif // NTRIPCLIENT_DEBUG_LOG
   }
+  log_msg("exiting");
+#ifdef NTRIPCLIENT_DEBUG_LOG
+  if (flogfile)
+    fclose(flogfile);
+#endif // NTRIPCLIENT_DEBUG_LOG
   return 0;
 }
